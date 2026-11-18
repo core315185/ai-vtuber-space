@@ -6,12 +6,14 @@ import uuid
 from pathlib import Path
 
 from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosed
 
 
 HOST = "localhost"
 PORT = 8765
 clients = set()
 client_connected = asyncio.Event()
+pending_acks = {}
 
 
 async def handler(websocket):
@@ -22,6 +24,19 @@ async def handler(websocket):
     try:
         async for message in websocket:
             print(message)
+            # ACKはIDごとの待機Futureへ渡し、呼び出し側で結果を確認できるようにする。
+            try:
+                response = json.loads(message)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(response, dict) and response.get("type") == "ack":
+                ack_id = response.get("id")
+                if isinstance(ack_id, str):
+                    waiter = pending_acks.get(ack_id)
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(response)
+    except ConnectionClosed:
+        pass
     finally:
         clients.discard(websocket)
         if not clients:
@@ -38,6 +53,37 @@ async def spawn_item(
     mass=1.0,
 ):
     """指定モデルの配置コマンドを接続中の全Unityへ送る。"""
+    command = _make_spawn_command(
+        model_path, position, rotation, scale, target_height_m, mass
+    )
+    await _broadcast(command)
+    return command["id"]
+
+
+async def spawn_item_and_wait(
+    model_path,
+    position,
+    rotation=(0, 0, 0),
+    scale=(1, 1, 1),
+    target_height_m=0.0,
+    mass=1.0,
+    timeout=30.0,
+):
+    """配置コマンドを送り、Unityから対応するACKが届くまで待つ。"""
+    command = _make_spawn_command(
+        model_path, position, rotation, scale, target_height_m, mass
+    )
+    waiter = asyncio.get_running_loop().create_future()
+    pending_acks[command["id"]] = waiter
+    try:
+        await _broadcast(command)
+        return await asyncio.wait_for(waiter, timeout=timeout)
+    finally:
+        pending_acks.pop(command["id"], None)
+
+
+def _make_spawn_command(model_path, position, rotation, scale, target_height_m, mass):
+    """Unityへ送る配置コマンドを組み立てる。"""
     command = {
         "command": "spawn_item",
         "id": uuid.uuid4().hex[:8],
@@ -48,12 +94,16 @@ async def spawn_item(
         "target_height_m": target_height_m,
         "mass": mass,
     }
+    return command
+
+
+async def _broadcast(command):
+    """配置コマンドを現在接続中の全クライアントへ送る。"""
     message = json.dumps(command, ensure_ascii=False)
     if clients:
         await asyncio.gather(*(client.send(message) for client in tuple(clients)))
     else:
         print("接続中のUnityクライアントがありません")
-    return command["id"]
 
 
 async def main():
